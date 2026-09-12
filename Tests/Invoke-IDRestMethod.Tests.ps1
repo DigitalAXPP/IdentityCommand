@@ -97,22 +97,67 @@ Describe $($PSCommandPath -Replace '.Tests.ps1') {
 
 			if ([Net.SecurityProtocolType].GetEnumNames() -contains 'Tls12') {
 
-				It 'enforces use of TLS 1.2' {
-					[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls11
-					Invoke-IDRestMethod @WebSession
-					[System.Net.ServicePointManager]::SecurityProtocol | Should -Be Tls12
+				It 'adds TLS 1.2 to an explicit legacy security protocol' {
+
+					If ($IsCoreCLR) { Set-ItResult -Inconclusive } Else {
+
+						$Original = [System.Net.ServicePointManager]::SecurityProtocol
+						try {
+							[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls11
+							Invoke-IDRestMethod @WebSession
+							([System.Net.ServicePointManager]::SecurityProtocol).HasFlag([Net.SecurityProtocolType]::Tls12) | Should -BeTrue
+						} finally {
+							[System.Net.ServicePointManager]::SecurityProtocol = $Original
+						}
+
+					}
+
+				}
+
+				It 'preserves the security protocols already permitted' {
+
+					If ($IsCoreCLR) { Set-ItResult -Inconclusive } Else {
+
+						$Original = [System.Net.ServicePointManager]::SecurityProtocol
+						try {
+							[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls11
+							Invoke-IDRestMethod @WebSession
+							([System.Net.ServicePointManager]::SecurityProtocol).HasFlag([Net.SecurityProtocolType]::Tls11) | Should -BeTrue
+						} finally {
+							[System.Net.ServicePointManager]::SecurityProtocol = $Original
+						}
+
+					}
+
+				}
+
+				It 'leaves a SystemDefault security protocol untouched' {
+
+					If ($IsCoreCLR) { Set-ItResult -Inconclusive } Else {
+
+						$Original = [System.Net.ServicePointManager]::SecurityProtocol
+						try {
+							[System.Net.ServicePointManager]::SecurityProtocol = 0
+							Invoke-IDRestMethod @WebSession
+							[int][System.Net.ServicePointManager]::SecurityProtocol | Should -Be 0
+						} finally {
+							[System.Net.ServicePointManager]::SecurityProtocol = $Original
+						}
+
+					}
+
 				}
 
 			}
 
-			It 'specifies -SslProtocol TLS12' {
+			It 'does not pin a TLS protocol' {
 
 				If ($IsCoreCLR) {
 
 					Mock Invoke-WebRequest -MockWith { }
 					Invoke-IDRestMethod @WebSession
 					Assert-MockCalled 'Invoke-WebRequest' -Times 1 -Scope It -Exactly -ParameterFilter {
-						$SslProtocol -eq 'TLS12'
+						-not $PSBoundParameters.ContainsKey('SslProtocol')
 					}
 				} else { Set-ItResult -Inconclusive }
 			}
@@ -154,6 +199,104 @@ Describe $($PSCommandPath -Replace '.Tests.ps1') {
 				Mock Get-IDResponse { }
 				Invoke-IDRestMethod @WebSession
 				Assert-MockCalled 'Get-IDResponse' -Times 0 -Scope It -Exactly
+			}
+
+		}
+
+		Context 'Body Handling' {
+
+			BeforeEach {
+
+				$ISPSSSession = [ordered]@{
+					tenant_url         = $null
+					User               = $null
+					TenantId           = $null
+					SessionId          = $null
+					WebSession         = $null
+					StartTime          = $null
+					ElapsedTime        = $null
+					LastCommand        = $null
+					LastCommandTime    = $null
+					LastCommandResults = $null
+				}
+				New-Variable -Name ISPSSSession -Value $ISPSSSession -Scope Script -Force
+
+				$Response = New-MockObject -Type Microsoft.PowerShell.Commands.WebResponseObject
+				$Response | Add-Member -MemberType NoteProperty -Name StatusCode -Value 200 -Force
+				$Response | Add-Member -MemberType NoteProperty -Name Headers -Value @{ 'Content-Type' = 'application/json; charset=utf-8' } -Force
+				$Response | Add-Member -MemberType NoteProperty -Name Content -Value (@{ 'success' = $true; 'Result' = @{} } | ConvertTo-Json) -Force
+
+				Mock Invoke-WebRequest -MockWith {
+
+					return $Response
+
+				}
+
+			}
+
+			It 'sends a String body to Invoke-WebRequest as UTF8 bytes, not the literal string' {
+
+				$WebSession = @{
+					'URI'        = 'https://CyberArk_URL'
+					'Method'     = 'GET'
+					'WebSession' = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+					'Body'       = '{"Password":"SomeSecret"}'
+				}
+
+				Invoke-IDRestMethod @WebSession
+
+				Assert-MockCalled Invoke-WebRequest -ParameterFilter {
+
+					$Body -is [Byte[]] -and $([System.Text.Encoding]::UTF8.GetString($Body)) -eq '{"Password":"SomeSecret"}'
+
+				} -Times 1 -Exactly -Scope It
+
+			}
+
+			It 'passes a Byte[] body through to Invoke-WebRequest unchanged' {
+
+				$Bytes = [System.Text.Encoding]::UTF8.GetBytes('{"Password":"SomeSecret"}')
+
+				$WebSession = @{
+					'URI'        = 'https://CyberArk_URL'
+					'Method'     = 'GET'
+					'WebSession' = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+					'Body'       = $Bytes
+				}
+
+				Invoke-IDRestMethod @WebSession
+
+				Assert-MockCalled Invoke-WebRequest -ParameterFilter {
+
+					$Body -is [Byte[]] -and $([System.Text.Encoding]::UTF8.GetString($Body)) -eq '{"Password":"SomeSecret"}'
+
+				} -Times 1 -Exactly -Scope It
+
+			}
+
+			It 'sanitises a Byte[] body in the debug preview, same as a String body' {
+
+				Mock Write-Debug -MockWith {}
+
+				$Bytes = [System.Text.Encoding]::UTF8.GetBytes('{"Password":"SomeSecret"}')
+
+				$WebSession = @{
+					'URI'        = 'https://CyberArk_URL'
+					'Method'     = 'GET'
+					'WebSession' = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+					'Body'       = $Bytes
+				}
+
+				$DebugPreference = 'Continue'
+				Invoke-IDRestMethod @WebSession
+				$DebugPreference = 'SilentlyContinue'
+
+				Assert-MockCalled Write-Debug -ParameterFilter {
+
+					$Message -match '\[Body\]' -and $Message -notmatch 'SomeSecret'
+
+				} -Times 1 -Exactly -Scope It
+
 			}
 
 		}
@@ -214,7 +357,7 @@ Describe $($PSCommandPath -Replace '.Tests.ps1') {
 				If ($IsCoreCLR) {
 					Mock Invoke-WebRequest { Throw $errorRecord }
 
-					{ Invoke-IDRestMethod @WebSession } | Should -Throw
+					{ Invoke-IDRestMethod @WebSession } | Should -Throw -ExpectedMessage 'Some Error Message'
 				} Else { Set-ItResult -Inconclusive }
 
 			}
@@ -225,7 +368,7 @@ Describe $($PSCommandPath -Replace '.Tests.ps1') {
 					$errorRecord = New-Object Management.Automation.ErrorRecord $exception, $errorID, $errorCategory, $targetObject
 					$errorRecord.ErrorDetails = $errorDetails
 					Mock Invoke-WebRequest { Throw $errorRecord }
-					{ Invoke-IDRestMethod @WebSession } | Should -Throw
+					{ Invoke-IDRestMethod @WebSession } | Should -Throw -ExpectedMessage ([System.Management.Automation.WildcardPattern]::Escape($errorDetails))
 				} Else { Set-ItResult -Inconclusive }
 			}
 
@@ -236,7 +379,7 @@ Describe $($PSCommandPath -Replace '.Tests.ps1') {
 					$errorRecord = New-Object Management.Automation.ErrorRecord $exception, $errorID, $errorCategory, $targetObject
 					$errorRecord.ErrorDetails = $errorDetails
 					Mock Invoke-WebRequest { Throw $errorRecord }
-					{ Invoke-IDRestMethod @WebSession } | Should -Throw
+					{ Invoke-IDRestMethod @WebSession } | Should -Throw -ExpectedMessage 'Some Error Message'
 				} Else { Set-ItResult -Inconclusive }
 			}
 
